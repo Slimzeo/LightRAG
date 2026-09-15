@@ -56,6 +56,7 @@ from lightrag.exceptions import (
     PipelineRecoveryRequiredError,
     PipelineReservationConflictError,
     IndexFlushError,
+    flush_may_have_lost_reference,
 )
 from lightrag.kg.shared_storage import (
     MANUAL_PHASE_DRAIN_TO_IDLE,
@@ -76,6 +77,7 @@ from lightrag.kg.shared_storage import (
     with_reservation_lock,
 )
 from lightrag import pipeline_metrics
+from lightrag.chunker.registry import chunker_identity
 from lightrag.kg.pipeline_ingress import PipelineIngressMessage
 from lightrag.operate import merge_nodes_and_edges
 from lightrag.parser.base import ParseContext
@@ -4952,6 +4954,57 @@ class _PipelineMixin:
                 from lightrag.chunker import chunking_by_token_size
 
                 is_builtin_chunker = self.chunking_func is chunking_by_token_size
+                # Diagnostic only: never resolve, reject or select a callback
+                # using a previous document's author-supplied identity.
+                uses_custom_callback = (
+                    not doc_process_opts.chunking_explicit
+                    or doc_process_opts.chunking == "C"
+                )
+                previous_identity = (
+                    status_doc.metadata.get("custom_chunker")
+                    if isinstance(status_doc.metadata, dict)
+                    else None
+                )
+                # An explicit F/R/V/P attempt never consults ``chunking_func``,
+                # so it has nothing to observe and MUST NOT overwrite the
+                # record: writing a null observation here made the next C
+                # attempt compare against that null and report a drift the
+                # deployment never had (C -> F -> C warned "None -> acme").
+                # Leaving the key alone lets carry-over preserve the last
+                # attempt that actually routed through the callback, which is
+                # the only baseline a drift comparison can be made against.
+                if uses_custom_callback:
+                    current_identity = chunker_identity(self.chunking_func)
+                    observation = current_identity or {
+                        "name": None,
+                        "version": None,
+                        "authoritative": False,
+                    }
+                    # Both paths that reach here consulted the callback, so
+                    # both compare. The selector is not what makes a drift
+                    # worth reporting, and gating on it left the quieter path
+                    # silent: on the no-selector path ``chunk_method`` is
+                    # ``legacy_chunking_func`` whether the built-in or a plugin
+                    # ran, and no fallback warning exists there either, so this
+                    # line is the ONLY signal that a document's chunking
+                    # changed between attempts.
+                    if isinstance(previous_identity, dict):
+                        if any(
+                            previous_identity.get(key) != observation[key]
+                            for key in ("name", "version")
+                        ):
+                            logger.warning(
+                                "Custom chunker identity changed for doc_id %s: %r@%r -> %r@%r; proceeding under current configuration (identity is non-authoritative)",
+                                doc_id,
+                                previous_identity.get("name"),
+                                previous_identity.get("version"),
+                                observation["name"],
+                                observation["version"],
+                            )
+                    if current_identity is not None or previous_identity is not None:
+                        # Set before invocation so a failed callback still names
+                        # the attempted configuration in the FAILED record.
+                        extraction_meta["custom_chunker"] = observation
                 if (
                     doc_process_opts.chunking_explicit
                     and doc_process_opts.chunking != "C"
@@ -5283,24 +5336,26 @@ class _PipelineMixin:
                     if isinstance(content_data, dict)
                     else None
                 )
-                extraction_meta = {
-                    "parse_format": persisted_format,
-                    # Shared resolver with the parse stage (_parse_worker), so a
-                    # field already stamped at PARSING re-writes to the same
-                    # value here — no value jump across the transition.
-                    "parse_engine": resolve_doc_status_parse_engine(
-                        persisted_format, persisted_engine
-                    ),
-                    # Set by the actual branch taken, not merely the persisted
-                    # selector. This distinguishes C custom success from its
-                    # fixed-token fallback after callback removal.
-                    "chunk_method": chunk_method,
-                    # Mirrors the chunking start log line (params portion only,
-                    # without the strategy prefix or file path) so admins can
-                    # see the actual chunker params used.  Carried across
-                    # transitions via ``_DOC_STATUS_METADATA_CARRY_OVER_KEYS``.
-                    "chunk_opts": chunk_opts_str,
-                }
+                extraction_meta.update(
+                    {
+                        "parse_format": persisted_format,
+                        # Shared resolver with the parse stage (_parse_worker), so a
+                        # field already stamped at PARSING re-writes to the same
+                        # value here — no value jump across the transition.
+                        "parse_engine": resolve_doc_status_parse_engine(
+                            persisted_format, persisted_engine
+                        ),
+                        # Set by the actual branch taken, not merely the persisted
+                        # selector. This distinguishes C custom success from its
+                        # fixed-token fallback after callback removal.
+                        "chunk_method": chunk_method,
+                        # Mirrors the chunking start log line (params portion only,
+                        # without the strategy prefix or file path) so admins can
+                        # see the actual chunker params used.  Carried across
+                        # transitions via ``_DOC_STATUS_METADATA_CARRY_OVER_KEYS``.
+                        "chunk_opts": chunk_opts_str,
+                    }
+                )
 
                 blocks_path = str(parsed_data.get("blocks_path") or "").strip()
                 if blocks_path:
@@ -5954,7 +6009,14 @@ class _PipelineMixin:
             self.text_chunks, "namespace", ""
         )  # the same spelling _flush_storages puts into IndexFlushError
         if self._chunk_reference_commit_failed or (
-            isinstance(error, IndexFlushError) and error.namespace == chunk_namespace
+            isinstance(error, IndexFlushError)
+            and error.namespace == chunk_namespace
+            # ...unless the backend proved that raise dropped nothing. The
+            # reason to distrust the retry is a buffer the backend drained
+            # behind our back; where that did not happen the retry below is a
+            # truthful witness, and believing the exception instead would
+            # withhold the partial cache this epilogue exists to save.
+            and flush_may_have_lost_reference(error)
         ):
             logger.error(
                 "Chunk cache references did not land after %s for d-id %s: "
@@ -5973,9 +6035,14 @@ class _PipelineMixin:
                 doc_id,
                 persist_error,
             )
-            await self._record_chunk_reference_commit_failure(
-                f"{stage_label} epilogue flush failed"
-            )
+            if flush_may_have_lost_reference(persist_error):
+                await self._record_chunk_reference_commit_failure(
+                    f"{stage_label} epilogue flush failed"
+                )
+            # A raise that dropped nothing still means this commit did not
+            # happen, so the cache half stays withheld -- but the rows keep
+            # their place in the buffer for the next ordered pair instead of
+            # being quarantined.
             return False
         # An explicit False is a DECLINED commit: the mutation was discarded,
         # so the references are not on disk either.

@@ -113,6 +113,10 @@ def _v2_answer_cache_key(
     production code: the point is to prove that v3 deliberately misses entries
     written before the default answer prompts learned document-date semantics.
     Do NOT refresh this helper when later key fields are added.
+
+    The KG snapshot includes the chunk-selection fields added in PR #3877;
+    the naive snapshot does not. Defaults stay literal so later changes cannot
+    silently update the historical key.
     """
     args = [
         "query-answer-cache-v2",
@@ -132,6 +136,18 @@ def _v2_answer_cache_key(
             param.user_prompt or "",
             param.enable_rerank,
             cfg.get("enable_content_headings", False),
+        ]
+    )
+    if keywords is not None:
+        args.extend(
+            [
+                "\n<kg_chunk_selection>\n",
+                cfg.get("related_chunk_number", 5),
+                cfg.get("kg_chunk_pick_method", "VECTOR"),
+            ]
+        )
+    args.extend(
+        [
             "\n<llm_identity>\n",
             serialize_llm_cache_identity(get_llm_cache_identity(cfg, "query")),
         ]
