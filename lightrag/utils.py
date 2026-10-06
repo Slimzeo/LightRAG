@@ -885,8 +885,11 @@ class EmbeddingFunc:
                 f"the model actually being called, and that the endpoint "
                 f"honours the requested output dimension. Vectors already "
                 f"stored under the previously declared dimension do not match "
-                f"the corrected one, so clear the data directory too unless "
-                f"nothing has been indexed yet."
+                f"the corrected one; unless nothing has been indexed yet, "
+                f"rebuild them with `lightrag-rebuild-vdb` after fixing the "
+                f"configuration. Do NOT clear the working directory -- that "
+                f"destroys the knowledge graph and text chunks the rebuild "
+                f"reads from."
             )
             raise ValueError(
                 f"Embedding dimension mismatch: expected dimension "
@@ -6053,9 +6056,10 @@ def strip_control_characters(text: str, replacement_char: str = "") -> str:
 _FORMFEED_LATEX_PATTERN = re.compile(r"\x0c(?=[A-Za-z])")
 _BACKSPACE_LATEX_PATTERN = re.compile(r"\x08(?=[A-Za-z])")
 # Whitespace + residue spelling that completes a common LaTeX command. Two
-# variants of one whitelist: _WS_LATEX_SUSPECT_PATTERN (\b) only warns, about
-# prose; _WS_LATEX_MATH_PATTERN ((?![A-Za-z])) is the one that rewrites, and
-# only inside a confirmed math span. Never swap their guards -- see *Residue
+# variants of one whitelist: _WS_LATEX_SUSPECT_PATTERN (a word boundary OR a
+# following non-ASCII character) only warns, about prose;
+# _WS_LATEX_MATH_PATTERN ((?![A-Za-z])) is the one that rewrites, and only
+# inside a confirmed math span. Never swap their guards -- see *Residue
 # whitelist and its two boundaries* in the contract doc,
 # docs/design/LatexEscapeRepairContract.md.
 # ``__END__`` is substituted with the trailing guard; a plain placeholder
@@ -6066,7 +6070,17 @@ _WS_LATEX_RESIDUES = (
     r"|\r(?=(?:ho|ight|angle|ceil)__END__)"
     r"|\n(?=(?:abla|otin)__END__)"
 )
-_WS_LATEX_SUSPECT_PATTERN = re.compile(_WS_LATEX_RESIDUES.replace("__END__", r"\b"))
+# A bare ``\b`` reports nothing when a word character follows, and Python's
+# ``re`` counts a CJK ideograph as a word character -- so a damaged command
+# sitting in Chinese prose with no dollar math around it was neither repaired
+# nor warned about. Hence the second alternative: a Latin fragment pressed
+# against a non-ASCII character with no space between them is essentially only
+# produced by this damage. ASCII word characters stay excluded -- in
+# tab-separated data ``col<tab>ext_id`` and ``<tab>au2`` are plausible values,
+# and the log noise is not worth them.
+_WS_LATEX_SUSPECT_PATTERN = re.compile(
+    _WS_LATEX_RESIDUES.replace("__END__", r"(?:\b|(?=[^\x00-\x7F]))")
+)
 _WS_LATEX_MATH_PATTERN = re.compile(
     _WS_LATEX_RESIDUES.replace("__END__", r"(?![A-Za-z])")
 )
